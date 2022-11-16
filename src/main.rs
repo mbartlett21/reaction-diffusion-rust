@@ -1,6 +1,6 @@
 
 extern crate minifb;
-extern crate threadpool;
+extern crate scoped_threadpool;
 
 use minifb::{Key, Window, WindowOptions, ScaleMode, Scale};
 use crate::sim::Simulation;
@@ -19,7 +19,6 @@ fn initGif() -> Encoder<File> {
     encoder
 }*/
 
-pub mod util;
 pub mod sim;
 
 fn main() {
@@ -62,7 +61,7 @@ fn main() {
         }
         
         if !window.is_key_down(Key::Space) {
-            window.update_with_buffer(&sim.framebuffer.get(), width, height).unwrap();
+            window.update_with_buffer(&sim.framebuffer, width, height).unwrap();
         } else {
             window.update();
         }

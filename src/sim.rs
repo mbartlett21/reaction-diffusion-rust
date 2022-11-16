@@ -1,9 +1,8 @@
-use std::ops::Range;
-use std::time::{Duration, Instant};
+use core::fmt;
+
 use chrono::Utc;
 use minifb::clamp;
-use threadpool::ThreadPool;
-use crate::util::InfCell;
+use scoped_threadpool::Pool;
 
 #[derive(Default, Debug, Copy, Clone)]
 pub struct Cell {
@@ -15,7 +14,7 @@ pub struct Cell {
 pub struct Grid {
     pub width: usize,
     pub height: usize,
-    pub cells: InfCell<Vec<Cell>>,
+    pub cells: Vec<Cell>,
 }
 
 impl Grid {
@@ -23,7 +22,7 @@ impl Grid {
         Self {
             width,
             height,
-            cells: InfCell::new(vec![Cell { a: 1., b: 0. }; width * height]),
+            cells: vec![Cell { a: 1., b: 0. }; width * height],
         }
     }
 }
@@ -38,14 +37,24 @@ pub struct SimulationParams {
     pub diag: f64,
 }
 
-#[derive(Debug)]
 pub struct Simulation {
     pub params: SimulationParams,
 
     cur_grid: Grid,
     nex_grid: Grid,
-    pub framebuffer: InfCell<Box<[u32]>>,
-    pool: ThreadPool,
+    pub framebuffer: Box<[u32]>,
+    pool: Pool,
+}
+
+impl fmt::Debug for Simulation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Simulation")
+            .field("params", &self.params)
+            .field("cur_grid", &self.cur_grid)
+            .field("nex_grid", &self.nex_grid)
+            .field("framebuffer", &self.framebuffer)
+            .finish()
+    }
 }
 
 impl Simulation {
@@ -61,8 +70,8 @@ impl Simulation {
 
         cur_grid: Grid::new(width, height),
         nex_grid: Grid::new(width, height),
-        framebuffer: InfCell::new(vec![0u32; width * height].into_boxed_slice()),
-        pool: ThreadPool::new(16),
+        framebuffer: vec![0u32; width * height].into_boxed_slice(),
+        pool: Pool::new(16),
     }}
 
     pub fn seed(&mut self) {
@@ -74,7 +83,7 @@ impl Simulation {
         let hi = ((width * height) as u64) - lo;
 
         // random set of '+' seeds
-        let cells = &mut self.cur_grid.cells.get_mut()[..];
+        let cells = &mut self.cur_grid.cells[..];
         /*for _ in 0..64 {
             let p = rng.rand_range(lo..hi) as usize;
             cells[p-1].b = 1.0;
@@ -87,37 +96,37 @@ impl Simulation {
     }
 
     pub fn generation(&mut self) {
-        let thread_count = self.pool.max_count();
+        let thread_count = self.pool.thread_count() as usize;
         let cell_count = self.cur_grid.width * self.cur_grid.height;
 
         let cells_per_thread = cell_count / thread_count;
 
-        let width = self.cur_grid.width;
-        let height = self.cur_grid.height;
+        self.pool.scoped(|s| {
+            let width = self.cur_grid.width;
+            let height = self.cur_grid.height;
 
-        for i in 0..thread_count {
-            let cur = self.cur_grid.cells.get();
-            let nex = self.nex_grid.cells.get_mut();
-            let fb = self.framebuffer.get_mut();
-            let range = (i * cells_per_thread)..((i + 1) * cells_per_thread);
-            let params = self.params.clone();
+            // How far the current chunk is offset
+            let mut offset = 0;
 
-            self.pool.execute(move || gen_job(width, height, cur, nex, fb, range, params));
-        }
+            // Shared between threads
+            let cur = &self.cur_grid.cells[..];
 
-        if cells_per_thread * thread_count < cell_count {
-            let cur = self.cur_grid.cells.get();
-            let nex = self.nex_grid.cells.get_mut();
-            let fb = self.framebuffer.get_mut();
-            let range = (cells_per_thread * thread_count)..cell_count;
-            let params = self.params.clone();
+            // Split between threads
+            let mut nex = &mut self.nex_grid.cells[..];
+            let mut frb = &mut self.framebuffer[..];
 
-            self.pool.execute(move || gen_job(width, height, cur, nex, fb, range, params));
-        }
+            while !nex.is_empty() {
+                // Split off the chunk for this thread
+                let (cnex, rnex) = nex.split_at_mut(cells_per_thread.min(nex.len()));
+                let (cfrb, rfrb) = frb.split_at_mut(cells_per_thread.min(frb.len()));
+                nex = rnex;
+                frb = rfrb;
 
-        //println!("");
-        //println!("Active: {} of {}", self.pool.active_count(), self.pool.max_count());
-        self.pool.join();
+                let params = self.params;
+                s.execute(move || gen_job(width, height, offset, cur, cnex, cfrb, params));
+                offset += cells_per_thread;
+            }
+        });
 
         self.swap();
     }
@@ -151,16 +160,18 @@ fn laplacian(cells: [[&Cell; 3]; 3], params: SimulationParams) -> (f64, f64) {
 fn gen_job(
     width: usize,
     height: usize,
-    cur: &[Cell],
+    offset: usize, // How much the offset is from the start
+    cur: &[Cell], // Curr isn't offset
     nex: &mut [Cell],
     framebuffer: &mut [u32],
-    range: Range<usize>,
     params: SimulationParams,
 ) {
-    debug_assert!(cur.len() == nex.len() && cur.len() == framebuffer.len());
-    for i in range {
-        let cx = i % width;
-        let cy = i / width;
+    debug_assert!(cur.len() == width * height);
+    debug_assert!(cur.len() >= framebuffer.len());
+    debug_assert!(nex.len() == framebuffer.len());
+    for i in 0..nex.len() {
+        let cx = (i + offset) % width;
+        let cy = (i + offset) / width;
 
         let cells = [
             [
